@@ -4,9 +4,18 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from open_deep_research.utils import get_today_str
 from tests.prompts import RELEVANCE_PROMPT, STRUCTURE_PROMPT, GROUNDEDNESS_PROMPT, OVERALL_QUALITY_PROMPT, CORRECTNESS_PROMPT, COMPLETENESS_PROMPT
+from dotenv import load_dotenv, find_dotenv
+import os
+
+load_dotenv(find_dotenv())
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "nvidia/Llama-3.1-70B-Instruct-FP8")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "notused")
 
 eval_model = ChatOpenAI(
-    model="gpt-4.1",
+    model=OPENAI_MODEL,
+    openai_api_base=OPENAI_API_BASE,
+    openai_api_key=OPENAI_API_KEY,
 )
 
 def _format_input_query(inputs: dict) -> str:

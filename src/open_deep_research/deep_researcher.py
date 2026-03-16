@@ -1,6 +1,7 @@
 """Main LangGraph implementation for the Deep Research agent."""
 
 import asyncio
+import logging
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -47,15 +48,72 @@ from open_deep_research.utils import (
     get_notes_from_tool_calls,
     get_today_str,
     is_token_limit_exceeded,
+    normalize_tavily_queries_arg,
     openai_websearch_called,
     remove_up_to_last_ai_message,
     think_tool,
 )
 
+from dotenv import load_dotenv, find_dotenv
+import os
+load_dotenv(find_dotenv())
+model = os.getenv("OPENAI_MODEL", "nvidia/Llama-3.1-70B-Instruct-FP8")
+
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
-    configurable_fields=("model", "max_tokens", "api_key"),
+    configurable_fields=(
+        "model",
+        "model_provider",
+        "max_tokens",
+        "api_key",
+        "extra_body",
+        "frequency_penalty",
+        "presence_penalty",
+    ),
 )
+
+
+# model = "nvidia/Llama-3.1-70B-Instruct-FP8"
+
+
+def _read_float_env(var_name: str) -> float | None:
+    """Parse float env vars safely; ignore invalid values."""
+    raw_value = os.getenv(var_name)
+    if raw_value is None or raw_value.strip() == "":
+        return None
+    try:
+        return float(raw_value)
+    except ValueError:
+        logging.warning("Invalid float value for %s=%r; ignoring", var_name, raw_value)
+        return None
+
+
+def _get_penalty_config() -> dict:
+    """Build optional OpenAI-compatible penalty kwargs for model calls."""
+    penalty_config = {}
+    frequency_penalty = _read_float_env("OPENAI_FREQUENCY_PENALTY")
+    presence_penalty = _read_float_env("OPENAI_PRESENCE_PENALTY")
+
+    if frequency_penalty is not None:
+        penalty_config["frequency_penalty"] = frequency_penalty
+    if presence_penalty is not None:
+        penalty_config["presence_penalty"] = presence_penalty
+
+    return penalty_config
+
+def _get_extra_body(config: RunnableConfig) -> dict:
+    """Build extra_body dict with job_id for LLM request tracking."""
+    configurable = Configuration.from_runnable_config(config)
+    extra_body = {}
+
+    if configurable.job_id:
+        extra_body["job_id"] = configurable.job_id
+
+    repetition_penalty = _read_float_env("OPENAI_REPETITION_PENALTY")
+    if repetition_penalty is not None:
+        extra_body["repetition_penalty"] = repetition_penalty
+
+    return extra_body
 
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
@@ -78,10 +136,20 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     
     # Step 2: Prepare the model for structured clarification analysis
     messages = state["messages"]
+    # model_config = {
+    #     "model": configurable.research_model,
+    #     "max_tokens": configurable.research_model_max_tokens,
+    #     "api_key": get_api_key_for_model(configurable.research_model, config),
+    #     "tags": ["langsmith:nostream"]
+    # }
+
     model_config = {
-        "model": configurable.research_model,
+        "model": model,
+        "model_provider": "openai",
         "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "api_key": get_api_key_for_model("openai:" + model, config),
+        "extra_body": _get_extra_body(config),
+        **_get_penalty_config(),
         "tags": ["langsmith:nostream"]
     }
     
@@ -132,9 +200,12 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
-        "model": configurable.research_model,
+        "model": model,
+        "model_provider": "openai",
         "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "api_key": get_api_key_for_model("openai:" + model, config),
+        "extra_body": _get_extra_body(config),
+        **_get_penalty_config(),
         "tags": ["langsmith:nostream"]
     }
     
@@ -192,9 +263,12 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     # Step 1: Configure the supervisor model with available tools
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
-        "model": configurable.research_model,
+        "model": model,
+        "model_provider": "openai",
         "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "api_key": get_api_key_for_model("openai:" + model, config),
+        "extra_body": _get_extra_body(config),
+        **_get_penalty_config(),
         "tags": ["langsmith:nostream"]
     }
     
@@ -382,6 +456,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Get all available research tools (search, MCP, think_tool)
     tools = await get_all_tools(config)
+    # print(tools)
     if len(tools) == 0:
         raise ValueError(
             "No tools found to conduct research: Please configure either your "
@@ -390,9 +465,12 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Step 2: Configure the researcher model with tools
     research_model_config = {
-        "model": configurable.research_model,
+        "model": model,
+        "model_provider": "openai",
         "max_tokens": configurable.research_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.research_model, config),
+        "api_key": get_api_key_for_model("openai:" + model, config),
+        "extra_body": _get_extra_body(config),
+        **_get_penalty_config(),
         "tags": ["langsmith:nostream"]
     }
     
@@ -432,6 +510,18 @@ async def execute_tool_safely(tool, args, config):
         return f"Error executing tool: {str(e)}"
 
 
+def normalize_tool_call_args(tool_name: str, args: dict) -> dict:
+    """Normalize known malformed tool arguments produced by some local models."""
+    if not isinstance(args, dict):
+        return args
+
+    if tool_name == "tavily_search" and "queries" in args:
+        normalized = normalize_tavily_queries_arg(args.get("queries"))
+        return {**args, "queries": normalized}
+
+    return args
+
+
 async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "compress_research"]]:
     """Execute tools called by the researcher, including search tools and strategic thinking.
     
@@ -469,23 +559,34 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         tool.name if hasattr(tool, "name") else tool.get("name", "web_search"): tool 
         for tool in tools
     }
+    # print(f"Tools available for execution: {list(tools_by_name.items())}")
     
     # Execute all tool calls in parallel
     tool_calls = most_recent_message.tool_calls
+    normalized_tool_calls = [
+        {
+            **tool_call,
+            "args": normalize_tool_call_args(tool_call["name"], tool_call.get("args", {})),
+        }
+        for tool_call in tool_calls
+    ]
+    # for tool_call in normalized_tool_calls:
+    #     print(f"Executing tool call: {tool_call['name']} with args: {tool_call['args']}")
+
     tool_execution_tasks = [
         execute_tool_safely(tools_by_name[tool_call["name"]], tool_call["args"], config) 
-        for tool_call in tool_calls
+        for tool_call in normalized_tool_calls
     ]
     observations = await asyncio.gather(*tool_execution_tasks)
     
     # Create tool messages from execution results
     tool_outputs = [
         ToolMessage(
-            content=observation,
+            content=str(observation) if not isinstance(observation, str) else observation,
             name=tool_call["name"],
             tool_call_id=tool_call["id"]
         ) 
-        for observation, tool_call in zip(observations, tool_calls)
+        for observation, tool_call in zip(observations, normalized_tool_calls)
     ]
     
     # Step 3: Check late exit conditions (after processing tools)
@@ -525,11 +626,15 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     # Step 1: Configure the compression model
     configurable = Configuration.from_runnable_config(config)
     synthesizer_model = configurable_model.with_config({
-        "model": configurable.compression_model,
+        "model": model,
+        "model_provider": "openai",
         "max_tokens": configurable.compression_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.compression_model, config),
+        "api_key": get_api_key_for_model("openai:" + model, config),
+        "extra_body": _get_extra_body(config),
+        **_get_penalty_config(),
         "tags": ["langsmith:nostream"]
     })
+
     
     # Step 2: Prepare messages for compression
     researcher_messages = state.get("researcher_messages", [])
@@ -625,9 +730,12 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = {
-        "model": configurable.final_report_model,
+        "model": model,
+        "model_provider": "openai",
         "max_tokens": configurable.final_report_model_max_tokens,
-        "api_key": get_api_key_for_model(configurable.final_report_model, config),
+        "api_key": get_api_key_for_model("openai:" + model, config),
+        "extra_body": _get_extra_body(config),
+        **_get_penalty_config(),
         "tags": ["langsmith:nostream"]
     }
     

@@ -231,6 +231,17 @@ class Configuration(BaseModel):
             }
         }
     )
+    # Job tracking
+    job_id: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": None,
+                "description": "Unique job identifier sent with each LLM request for tracking and correlation."
+            }
+        }
+    )
 
 
     @classmethod

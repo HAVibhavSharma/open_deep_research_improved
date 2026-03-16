@@ -145,6 +145,12 @@ You can use any of the tools provided to you to find resources that can help ans
 <Available Tools>
 You have access to two main tools:
 1. **tavily_search**: For conducting web searches to gather information
+IMPORTANT: When you call tavily_search, the tool arguments must be valid JSON and follow this exact schema:
+- Correct: {{"queries": ["query 1", "query 2"]}}
+- Correct (single query): {{"queries": ["query 1"]}}
+- Incorrect: {{"queries": "[\"query 1\", \"query 2\"]"}}
+- Incorrect: {{"queries": "query 1"}}
+Before sending a tool call, verify that `queries` is an array value, not a quoted string.
 2. **think_tool**: For reflection and strategic planning during research
 {mcp_prompt}
 

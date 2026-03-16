@@ -1,6 +1,7 @@
 """Utility functions and helpers for the Deep Research agent."""
 
 import asyncio
+import json
 import logging
 import os
 import warnings
@@ -33,24 +34,58 @@ from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+model = os.getenv("OPENAI_MODEL", "nvidia/Llama-3.1-70B-Instruct-FP8")
+
+
+def _read_float_env(var_name: str) -> float | None:
+    """Parse float environment variables safely."""
+    raw_value = os.getenv(var_name)
+    if raw_value is None or raw_value.strip() == "":
+        return None
+    try:
+        return float(raw_value)
+    except ValueError:
+        logging.warning("Invalid float value for %s=%r; ignoring", var_name, raw_value)
+        return None
+
+
+def _get_penalty_config() -> dict:
+    """Build optional OpenAI-compatible penalty kwargs for model calls."""
+    penalty_config = {}
+    frequency_penalty = _read_float_env("OPENAI_FREQUENCY_PENALTY")
+    presence_penalty = _read_float_env("OPENAI_PRESENCE_PENALTY")
+
+    if frequency_penalty is not None:
+        penalty_config["frequency_penalty"] = frequency_penalty
+    if presence_penalty is not None:
+        penalty_config["presence_penalty"] = presence_penalty
+
+    return penalty_config
+
 ##########################
 # Tavily Search Tool Utils
 ##########################
 TAVILY_SEARCH_DESCRIPTION = (
     "A search engine optimized for comprehensive, accurate, and trusted results. "
     "Useful for when you need to answer questions about current events."
+    "IMPORTANT: Tool arguments must be valid JSON. The queries field must be a JSON array of strings, not a string. "
+    "Correct: {\"queries\":[\"What is the capital of France?\",\"What is the population of France?\"]}. "
+    "Incorrect: {\"queries\":\"[\\\"What is the capital of France?\\\",\\\"What is the population of France?\\\"]\"}. "
+    "For a single query, still use an array: {\"queries\":[\"Who won the most recent FIFA World Cup?\"]}."
 )
 @tool(description=TAVILY_SEARCH_DESCRIPTION)
 async def tavily_search(
     queries: List[str],
-    max_results: Annotated[int, InjectedToolArg] = 5,
+    max_results: Annotated[int, InjectedToolArg] = 1,  # I can tune this
     topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
     config: RunnableConfig = None
 ) -> str:
     """Fetch and summarize search results from Tavily search API.
 
     Args:
-        queries: List of search queries to execute
+        queries: List of search queries (strings) to execute
         max_results: Maximum number of results to return per query
         topic: Topic filter for search results (general, news, or finance)
         config: Runtime configuration for API keys and model settings
@@ -82,11 +117,21 @@ async def tavily_search(
     max_char_to_include = configurable.max_content_length
     
     # Initialize summarization model with retry logic
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    model_api_key = get_api_key_for_model("openai:" + model, config)
+    _extra_body = {}
+    if configurable.job_id:
+        _extra_body["job_id"] = configurable.job_id
+    repetition_penalty = _read_float_env("OPENAI_REPETITION_PENALTY")
+    if repetition_penalty is not None:
+        _extra_body["repetition_penalty"] = repetition_penalty
+
     summarization_model = init_chat_model(
-        model=configurable.summarization_model,
+        model=model,
+        model_provider="openai",
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
+        extra_body=_extra_body,
+        **_get_penalty_config(),
         tags=["langsmith:nostream"]
     ).with_structured_output(Summary).with_retry(
         stop_after_attempt=configurable.max_structured_output_retries
@@ -97,6 +142,7 @@ async def tavily_search(
         """No-op function for results without raw content."""
         return None
     
+    # This is where the summarization is called.
     summarization_tasks = [
         noop() if not result.get("raw_content") 
         else summarize_webpage(
@@ -134,6 +180,37 @@ async def tavily_search(
         formatted_output += "\n\n" + "-" * 80 + "\n"
     
     return formatted_output
+
+
+def normalize_tavily_queries_arg(queries: Any) -> list[str]:
+    """Normalize tavily `queries` arg into a list of non-empty strings.
+
+    Handles common LLM tool-call mistakes such as stringified JSON arrays.
+    """
+    if isinstance(queries, list):
+        return [str(item).strip() for item in queries if str(item).strip()]
+
+    if isinstance(queries, str):
+        stripped = queries.strip()
+        if not stripped:
+            return []
+
+        # First try JSON parsing for common malformed payloads like "[\"q1\", \"q2\"]".
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            if isinstance(parsed, str) and parsed.strip():
+                return [parsed.strip()]
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: treat a plain string as a single query.
+        return [stripped]
+
+    # Last-resort fallback for unexpected scalar/object types.
+    as_text = str(queries).strip()
+    return [as_text] if as_text else []
 
 async def tavily_search_async(
     search_queries, 
@@ -192,7 +269,7 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Execute summarization with timeout to prevent hanging
         summary = await asyncio.wait_for(
             model.ainvoke([HumanMessage(content=prompt_content)]),
-            timeout=60.0  # 60 second timeout for summarization
+            timeout=240.0  # 240 second timeout for summarization. Need to tune this as well.
         )
         
         # Format the summary with structured sections
@@ -205,7 +282,7 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         
     except asyncio.TimeoutError:
         # Timeout during summarization - return original content
-        logging.warning("Summarization timed out after 60 seconds, returning original content")
+        logging.warning("Summarization timed out after 240 seconds, returning original content")
         return webpage_content
     except Exception as e:
         # Other errors during summarization - log and return original content
