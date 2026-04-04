@@ -1,7 +1,11 @@
 """Main LangGraph implementation for the Deep Research agent."""
 
 import asyncio
+import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -55,7 +59,6 @@ from open_deep_research.utils import (
 )
 
 from dotenv import load_dotenv, find_dotenv
-import os
 load_dotenv(find_dotenv())
 model = os.getenv("OPENAI_MODEL", "nvidia/Llama-3.1-70B-Instruct-FP8")
 
@@ -115,6 +118,139 @@ def _get_extra_body(config: RunnableConfig) -> dict:
 
     return extra_body
 
+
+def _get_timing_log_path() -> Path:
+    """Resolve timing log output path from env or default filename."""
+    raw_path = os.getenv("TOOLCALL_TIMING_LOG_PATH", "tool_call_timing.jsonl")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _append_timing_log(entry: dict) -> None:
+    """Append one JSONL record with tool-call timing details."""
+    log_path = _get_timing_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+
+def _chunk_has_tool_call_signal(chunk) -> bool:
+    """Detect whether a streamed chunk contains any sign of a tool call."""
+    tool_call_chunks = getattr(chunk, "tool_call_chunks", None)
+    if tool_call_chunks:
+        return True
+
+    tool_calls = getattr(chunk, "tool_calls", None)
+    if tool_calls:
+        return True
+
+    additional_kwargs = getattr(chunk, "additional_kwargs", None) or {}
+    if additional_kwargs.get("tool_calls"):
+        return True
+    if additional_kwargs.get("function_call"):
+        return True
+
+    return False
+
+
+def _extract_job_id(config: RunnableConfig) -> str | None:
+    """Extract job identifier from runnable config when available."""
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    job_id = configurable.get("job_id") if isinstance(configurable, dict) else None
+    return str(job_id) if job_id else None
+
+
+async def _ainvoke_with_tool_call_timing(
+    *,
+    node_name: str,
+    llm,
+    messages,
+    config: RunnableConfig,
+    extra_fields: dict | None = None,
+) -> AIMessage:
+    """Stream an LLM call, detect earliest tool-call signal, and log timings."""
+    route_map = {
+        "researcher": {
+            "tool": "researcher_tools",
+            "non_tool": "compress_research",
+        },
+        "supervisor": {
+            "tool": "supervisor_tools",
+            "non_tool": "end",
+        },
+    }
+    node_routes = route_map.get(
+        node_name,
+        {
+            "tool": "tool_node",
+            "non_tool": "non_tool_node",
+        },
+    )
+
+    generation_start_perf_ns = time.perf_counter_ns()
+    first_tool_call_seen_perf_ns = None
+    chunk_count = 0
+    accumulated = None
+
+    async for chunk in llm.astream(messages):
+        chunk_count += 1
+        if first_tool_call_seen_perf_ns is None and _chunk_has_tool_call_signal(chunk):
+            first_tool_call_seen_perf_ns = time.perf_counter_ns()
+
+        if accumulated is None:
+            accumulated = chunk
+        else:
+            accumulated += chunk
+
+    generation_end_perf_ns = time.perf_counter_ns()
+
+    if accumulated is None:
+        response = AIMessage(content="")
+    elif hasattr(accumulated, "to_message"):
+        response = accumulated.to_message()
+    else:
+        response = AIMessage(
+            content=str(getattr(accumulated, "content", "")),
+            additional_kwargs=getattr(accumulated, "additional_kwargs", {}) or {},
+            tool_calls=getattr(accumulated, "tool_calls", []) or [],
+        )
+
+    has_tool_calls = bool(getattr(response, "tool_calls", None))
+    if first_tool_call_seen_perf_ns is None and has_tool_calls:
+        # Fallback for providers that only materialize tool calls at generation end.
+        first_tool_call_seen_perf_ns = generation_end_perf_ns
+
+    prediction_timestamp_perf_ns = first_tool_call_seen_perf_ns or generation_end_perf_ns
+    prediction_to_end_latency_ns = (
+        generation_end_perf_ns - first_tool_call_seen_perf_ns
+        if first_tool_call_seen_perf_ns is not None
+        else 0
+    )
+
+    log_entry = {
+        "event_type": "node_tool_call_timing",
+        "node": node_name,
+        "model": model,
+        "job_id": _extract_job_id(config),
+        "generation_start_perf_ns": generation_start_perf_ns,
+        "first_tool_call_seen_perf_ns": first_tool_call_seen_perf_ns,
+        "prediction_timestamp_perf_ns": prediction_timestamp_perf_ns,
+        "generation_end_perf_ns": generation_end_perf_ns,
+        "prediction_to_end_latency_ns": prediction_to_end_latency_ns,
+        "chunk_count": chunk_count,
+        "has_tool_calls": has_tool_calls,
+        "tool_route_target": node_routes["tool"],
+        "non_tool_route_target": node_routes["non_tool"],
+        "predicted_route": node_routes["tool"] if first_tool_call_seen_perf_ns is not None else node_routes["non_tool"],
+    }
+    if extra_fields:
+        log_entry.update(extra_fields)
+    _append_timing_log(log_entry)
+
+    return response
+
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
     
@@ -166,6 +302,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         messages=get_buffer_string(messages), 
         date=get_today_str()
     )
+    # NOTE: Both the system prompt and the user prompt being wrapped into HumanMessage. Date is dynamic, there should be a way to make it static. We can have a small script that updates the date once per day at the application end.
     response = await clarification_model.ainvoke([HumanMessage(content=prompt_content)])
     
     # Step 4: Route based on clarification analysis
@@ -222,6 +359,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     )
+    # NOTE: Both the system prompt and the user prompt being wrapped into HumanMessage. Date is dynamic, there should be a way to make it static. We can have a small script that updates the date once per day at the application end.
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
     
     # Step 3: Initialize supervisor with research brief and instructions
@@ -285,7 +423,15 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
     
     # Step 2: Generate supervisor response based on current context
     supervisor_messages = state.get("supervisor_messages", [])
-    response = await research_model.ainvoke(supervisor_messages)
+    response = await _ainvoke_with_tool_call_timing(
+        node_name="supervisor",
+        llm=research_model,
+        messages=supervisor_messages,
+        config=config,
+        extra_fields={
+            "research_iterations": state.get("research_iterations", 0),
+        },
+    )
     
     # Step 3: Update state and proceed to tool execution
     return Command(
@@ -475,6 +621,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     }
     
     # Prepare system prompt with MCP context if available
+    # NOTE: Static
     researcher_prompt = research_system_prompt.format(
         mcp_prompt=configurable.mcp_prompt or "", 
         date=get_today_str()
@@ -490,7 +637,16 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Step 3: Generate researcher response with system context
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await research_model.ainvoke(messages)
+    response = await _ainvoke_with_tool_call_timing(
+        node_name="researcher",
+        llm=research_model,
+        messages=messages,
+        config=config,
+        extra_fields={
+            "tool_call_iterations": state.get("tool_call_iterations", 0),
+            "research_topic": state.get("research_topic", ""),
+        },
+    )
     
     # Step 4: Update state and proceed to tool execution
     return Command(
@@ -650,6 +806,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         try:
             # Create system prompt focused on compression task
             compression_prompt = compress_research_system_prompt.format(date=get_today_str())
+            # NOTE: Static prompt
             messages = [SystemMessage(content=compression_prompt)] + researcher_messages
             
             # Execute compression
