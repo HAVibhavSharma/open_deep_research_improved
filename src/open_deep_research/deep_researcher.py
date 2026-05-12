@@ -21,6 +21,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from open_deep_research.chunked_chat_client import build_chunked_chat_http_client
 from open_deep_research.configuration import (
     Configuration,
 )
@@ -62,6 +63,12 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 model = os.getenv("OPENAI_MODEL", "nvidia/Llama-3.1-70B-Instruct-FP8")
 
+# Shared httpx client that reroutes every chat completion call to
+# /v1/chunked_chat/completions, marking the system prompt as an anchor chunk.
+_CHUNKED_HTTP_CLIENT = build_chunked_chat_http_client(
+    agent_id=os.getenv("CHUNKED_CHAT_AGENT_ID", "open-deep-research"),
+)
+
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
     configurable_fields=(
@@ -72,6 +79,7 @@ configurable_model = init_chat_model(
         "extra_body",
         "frequency_penalty",
         "presence_penalty",
+        "http_async_client",
     ),
 )
 
@@ -286,6 +294,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         "api_key": get_api_key_for_model("openai:" + model, config),
         "extra_body": _get_extra_body(config),
         **_get_penalty_config(),
+        "http_async_client": _CHUNKED_HTTP_CLIENT,
         "tags": ["langsmith:nostream"]
     }
     
@@ -343,6 +352,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         "api_key": get_api_key_for_model("openai:" + model, config),
         "extra_body": _get_extra_body(config),
         **_get_penalty_config(),
+        "http_async_client": _CHUNKED_HTTP_CLIENT,
         "tags": ["langsmith:nostream"]
     }
     
@@ -407,6 +417,7 @@ async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[
         "api_key": get_api_key_for_model("openai:" + model, config),
         "extra_body": _get_extra_body(config),
         **_get_penalty_config(),
+        "http_async_client": _CHUNKED_HTTP_CLIENT,
         "tags": ["langsmith:nostream"]
     }
     
@@ -617,6 +628,7 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         "api_key": get_api_key_for_model("openai:" + model, config),
         "extra_body": _get_extra_body(config),
         **_get_penalty_config(),
+        "http_async_client": _CHUNKED_HTTP_CLIENT,
         "tags": ["langsmith:nostream"]
     }
     
@@ -788,6 +800,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
         "api_key": get_api_key_for_model("openai:" + model, config),
         "extra_body": _get_extra_body(config),
         **_get_penalty_config(),
+        "http_async_client": _CHUNKED_HTTP_CLIENT,
         "tags": ["langsmith:nostream"]
     })
 
@@ -893,6 +906,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         "api_key": get_api_key_for_model("openai:" + model, config),
         "extra_body": _get_extra_body(config),
         **_get_penalty_config(),
+        "http_async_client": _CHUNKED_HTTP_CLIENT,
         "tags": ["langsmith:nostream"]
     }
     

@@ -30,6 +30,7 @@ from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
 
+from open_deep_research.chunked_chat_client import build_chunked_chat_http_client
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
@@ -37,6 +38,11 @@ from open_deep_research.state import ResearchComplete, Summary
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 model = os.getenv("OPENAI_MODEL", "nvidia/Llama-3.1-70B-Instruct-FP8")
+
+# Shared client so webpage-summary LLM calls also hit /v1/chunked_chat/completions
+_CHUNKED_HTTP_CLIENT = build_chunked_chat_http_client(
+    agent_id=os.getenv("CHUNKED_CHAT_AGENT_ID", "open-deep-research"),
+)
 
 
 def _read_float_env(var_name: str) -> float | None:
@@ -131,6 +137,7 @@ async def tavily_search(
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
         extra_body=_extra_body,
+        http_async_client=_CHUNKED_HTTP_CLIENT,
         **_get_penalty_config(),
         tags=["langsmith:nostream"]
     ).with_structured_output(Summary).with_retry(
