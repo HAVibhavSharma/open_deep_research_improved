@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 from typing import Any
 
 import httpx
@@ -30,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 _CHAT_SUFFIX = "/chat/completions"
 _CHUNKED_SUFFIX = "/chunked_chat/completions"
+_DEBUG = os.getenv("CHUNKED_CHAT_DEBUG", "").strip() not in ("", "0", "false", "False")
+
+
+def _debug(msg: str) -> None:
+    if _DEBUG:
+        print(f"[chunked_chat] {msg}", file=sys.stderr, flush=True)
 
 
 def _content_to_text(content: Any) -> str:
@@ -85,9 +93,18 @@ class ChunkedChatHTTPClient(httpx.AsyncClient):
         self._agent_id = agent_id
 
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        original_url = str(request.url)
         if request.url.path.endswith(_CHAT_SUFFIX):
             request = self._rewrite(request)
-        return await super().send(request, **kwargs)
+            _debug(f"rewrote {original_url} -> {request.url}")
+        else:
+            _debug(f"pass-through {request.method} {request.url}")
+        response = await super().send(request, **kwargs)
+        if response.status_code >= 400:
+            msg = f"{request.method} {request.url} -> {response.status_code}"
+            logger.warning("chunked_chat: %s", msg)
+            _debug(msg)
+        return response
 
     def _rewrite(self, request: httpx.Request) -> httpx.Request:
         try:
