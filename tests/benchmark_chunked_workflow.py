@@ -1,31 +1,39 @@
 """End-to-end benchmark for the deep researcher workflow running through
 the vLLM `/v1/chunked_chat/completions` endpoint.
 
-Captures per-LLM-call metrics via a LangChain async callback handler and
-prints an aggregated report at the end. Optionally repeats the same query
-N times so you can see how TTFT improves once the anchor pool warms up.
+Per-request metrics are collected at the httpx layer (inside
+ChunkedChatHTTPClient.metrics) rather than via LangChain callbacks, because
+LangGraph in this project does not reliably propagate callbacks through
+all nested model.ainvoke calls.
 
-Metrics collected (per LLM call):
-    - node             which LangGraph node issued the call
-    - ttft             time from llm_start to the first streamed token
-                       (only meaningful for streaming calls)
-    - latency          llm_start -> llm_end wall time
-    - prompt_tokens    from response usage_metadata
-    - completion_tok   from response usage_metadata
-    - had_system       True if a SystemMessage was in the prompt
-                       (-> an anchor chunk was sent)
+Metrics per request (one HTTP request per LLM call):
+    - latency_to_headers   wall time from request-sent to first response
+                           header. For streaming this is ~TTFT; for
+                           non-streaming it's "time to first byte".
+    - status               HTTP status code (200 on success)
+    - model                model name from the request body
+    - n_chunks             number of chunks the rewriter produced
+    - n_anchor_indices     how many of those are anchors (system prompt)
+    - anchor_chars         total chars in anchor chunks
+    - dynamic_chars        total chars in non-anchor chunks
+    - stream               True if the openai SDK requested streaming
+    - request_bytes        size of the rewritten request body
+    - has_tools            True if `tools` was present in the request
 
 Aggregates printed:
-    - total wall time
-    - total LLM calls + per-node counts
-    - sum of prompt/completion tokens
-    - mean / median / max TTFT and latency, overall and per-node
+    - total wall time of the workflow
+    - total HTTP requests (= LLM calls)
+    - sum of anchor_chars, dynamic_chars, request_bytes
+    - mean / median / max latency_to_headers
+    - count of streaming vs non-streaming
+    - count of tool-using vs not
 
-Server-side anchor-pool stats (cache hits, base captures, admit/activate
-decisions) are NOT collected here -- read them from the vLLM server log
-by greping for `[chunked_chat]` and `[anchor-pool]`.
+Server-side anchor pool stats (cache hits, base captures, admit/activate)
+are NOT visible here -- grep the vLLM server log for `[chunked_chat]` and
+`[anchor-pool]` lines.
 
 Usage:
+    CHUNKED_CHAT_DEBUG=1 OPENAI_BASE_URL=http://localhost:8000/v1 \\
     .venv/bin/python tests/benchmark_chunked_workflow.py \\
         --query "What are the latest developments in fusion energy?" \\
         --runs 2
@@ -37,127 +45,15 @@ import argparse
 import asyncio
 import statistics
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import Counter
 from typing import Any
-from uuid import UUID
 
-from langchain_core.callbacks.base import AsyncCallbackHandler
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
-from open_deep_research.deep_researcher import deep_researcher
-
-
-@dataclass
-class LLMCall:
-    run_id: str
-    node: str
-    started: float
-    first_token: float | None = None
-    ended: float | None = None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
-    had_system: bool = False
-    n_messages: int = 0
-
-
-class MetricsHandler(AsyncCallbackHandler):
-    """Records per-LLM-call timing and token usage."""
-
-    def __init__(self) -> None:
-        self.calls: list[LLMCall] = []
-        self._by_run: dict[str, LLMCall] = {}
-        self._node_stack: list[str] = []
-
-    async def on_chain_start(
-        self,
-        serialized: dict | None,
-        inputs: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict | None = None,
-        **kwargs: Any,
-    ) -> None:
-        name = None
-        if serialized:
-            name = serialized.get("name")
-        name = name or kwargs.get("name") or "?"
-        self._node_stack.append(name)
-
-    async def on_chain_end(self, outputs: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        if self._node_stack:
-            self._node_stack.pop()
-
-    async def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        if self._node_stack:
-            self._node_stack.pop()
-
-    async def on_chat_model_start(
-        self,
-        serialized: dict,
-        messages: list[list[Any]],
-        *,
-        run_id: UUID,
-        **kwargs: Any,
-    ) -> None:
-        had_system = False
-        n = 0
-        for msg_list in messages or []:
-            n += len(msg_list)
-            for m in msg_list:
-                if isinstance(m, SystemMessage) or getattr(m, "type", "") == "system":
-                    had_system = True
-        node = self._node_stack[-1] if self._node_stack else "?"
-        call = LLMCall(
-            run_id=str(run_id),
-            node=node,
-            started=time.perf_counter(),
-            had_system=had_system,
-            n_messages=n,
-        )
-        self._by_run[str(run_id)] = call
-        self.calls.append(call)
-
-    async def on_llm_new_token(self, token: str, *, run_id: UUID, **kwargs: Any) -> None:
-        call = self._by_run.get(str(run_id))
-        if call and call.first_token is None:
-            call.first_token = time.perf_counter()
-
-    async def on_llm_end(self, response: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        call = self._by_run.get(str(run_id))
-        if not call:
-            return
-        call.ended = time.perf_counter()
-
-        # Prefer usage_metadata on the AIMessage; fall back to llm_output.token_usage.
-        try:
-            for gen_list in getattr(response, "generations", []) or []:
-                for gen in gen_list:
-                    msg = getattr(gen, "message", None)
-                    if msg is None:
-                        continue
-                    usage = getattr(msg, "usage_metadata", None) or {}
-                    if usage:
-                        call.prompt_tokens = usage.get("input_tokens") or call.prompt_tokens
-                        call.completion_tokens = usage.get("output_tokens") or call.completion_tokens
-                        call.total_tokens = usage.get("total_tokens") or call.total_tokens
-        except Exception:
-            pass
-
-        try:
-            llm_output = getattr(response, "llm_output", None) or {}
-            token_usage = llm_output.get("token_usage") or {}
-            if token_usage:
-                call.prompt_tokens = call.prompt_tokens or token_usage.get("prompt_tokens")
-                call.completion_tokens = (
-                    call.completion_tokens or token_usage.get("completion_tokens")
-                )
-                call.total_tokens = call.total_tokens or token_usage.get("total_tokens")
-        except Exception:
-            pass
+# Importing deep_researcher also creates the shared _CHUNKED_HTTP_CLIENT
+# that the graph wires into every chat model.
+from open_deep_research.deep_researcher import _CHUNKED_HTTP_CLIENT, deep_researcher
+from open_deep_research.chunked_chat_client import ChunkedRequestMetric
 
 
 def _fmt_secs(xs: list[float]) -> str:
@@ -170,78 +66,62 @@ def _fmt_secs(xs: list[float]) -> str:
     )
 
 
-def format_report(calls: list[LLMCall], wall_s: float, label: str = "") -> str:
-    lines: list[str] = []
-    header = "DEEP RESEARCHER WORKFLOW BENCHMARK (chunked_chat)"
-    if label:
-        header += f"  --  {label}"
-    lines.append("=" * len(header))
-    lines.append(header)
-    lines.append("=" * len(header))
+def format_report(
+    metrics: list[ChunkedRequestMetric], wall_s: float, label: str
+) -> str:
+    header = f"DEEP RESEARCHER WORKFLOW BENCHMARK (chunked_chat)  --  {label}"
+    bar = "=" * len(header)
+    out = [bar, header, bar]
+    out.append(f"  total_wall_s         : {wall_s:.3f}")
+    out.append(f"  total_http_requests  : {len(metrics)}")
 
-    lines.append(f"  total_wall_s         : {wall_s:.3f}")
-    lines.append(f"  total_llm_calls      : {len(calls)}")
-    lines.append(
-        f"  total_prompt_tokens  : {sum((c.prompt_tokens or 0) for c in calls)}"
+    statuses = Counter(m.status for m in metrics)
+    out.append(f"  status_counts        : {dict(statuses)}")
+    out.append(
+        f"  streaming / non-stream: "
+        f"{sum(1 for m in metrics if m.stream)} / "
+        f"{sum(1 for m in metrics if not m.stream)}"
     )
-    lines.append(
-        f"  total_completion_tok : {sum((c.completion_tokens or 0) for c in calls)}"
+    out.append(
+        f"  tool_using / not     : "
+        f"{sum(1 for m in metrics if m.has_tools)} / "
+        f"{sum(1 for m in metrics if not m.has_tools)}"
     )
 
-    ttfts = [c.first_token - c.started for c in calls if c.first_token is not None]
-    latencies = [c.ended - c.started for c in calls if c.ended is not None]
-    lines.append(f"  ttft     ({len(ttfts):>2} calls): {_fmt_secs(ttfts)}")
-    lines.append(f"  latency  ({len(latencies):>2} calls): {_fmt_secs(latencies)}")
+    total_anchor = sum(m.anchor_chars for m in metrics)
+    total_dynamic = sum(m.dynamic_chars for m in metrics)
+    total_bytes = sum(m.request_bytes for m in metrics)
+    out.append(f"  total_anchor_chars   : {total_anchor}")
+    out.append(f"  total_dynamic_chars  : {total_dynamic}")
+    out.append(f"  total_request_bytes  : {total_bytes}")
 
-    lines.append("")
-    lines.append("Per-node breakdown:")
-    lines.append(
-        f"  {'node':<32} {'n':>3}  "
-        f"{'mean_ttft':>10}  {'mean_lat':>10}  "
-        f"{'sum_p_tok':>10}  {'sum_c_tok':>10}"
+    lats = [m.latency_to_headers for m in metrics if m.latency_to_headers is not None]
+    out.append(f"  latency_to_headers   : {_fmt_secs(lats)}")
+
+    out.append("")
+    out.append("Per-request detail:")
+    out.append(
+        f"  {'#':>3}  {'status':>6}  {'lat_s':>7}  "
+        f"{'anc_ch':>7}  {'dyn_ch':>7}  {'req_B':>7}  "
+        f"{'stream':>6}  {'tools':>5}"
     )
-    by_node: dict[str, list[LLMCall]] = defaultdict(list)
-    for c in calls:
-        by_node[c.node].append(c)
-    for node, cs in sorted(by_node.items()):
-        ttfts_n = [c.first_token - c.started for c in cs if c.first_token is not None]
-        lats_n = [c.ended - c.started for c in cs if c.ended is not None]
-        pt = sum((c.prompt_tokens or 0) for c in cs)
-        ct = sum((c.completion_tokens or 0) for c in cs)
-        m_ttft = f"{statistics.mean(ttfts_n):.3f}s" if ttfts_n else "n/a"
-        m_lat = f"{statistics.mean(lats_n):.3f}s" if lats_n else "n/a"
-        lines.append(
-            f"  {node[:32]:<32} {len(cs):>3}  "
-            f"{m_ttft:>10}  {m_lat:>10}  "
-            f"{pt:>10}  {ct:>10}"
+    for i, m in enumerate(metrics, 1):
+        lat = m.latency_to_headers
+        out.append(
+            f"  {i:>3}  {str(m.status or '?'):>6}  "
+            f"{(f'{lat:.3f}' if lat is not None else 'n/a'):>7}  "
+            f"{m.anchor_chars:>7}  {m.dynamic_chars:>7}  "
+            f"{m.request_bytes:>7}  "
+            f"{('yes' if m.stream else 'no'):>6}  "
+            f"{('yes' if m.has_tools else 'no'):>5}"
         )
-
-    lines.append("")
-    lines.append("Per-call detail:")
-    lines.append(
-        f"  {'#':>3} {'node':<28} {'ttft':>8} {'lat':>8} "
-        f"{'p_tok':>6} {'c_tok':>6} {'sys?':>4}"
-    )
-    for i, c in enumerate(calls, 1):
-        ttft = (c.first_token - c.started) if c.first_token is not None else None
-        lat = (c.ended - c.started) if c.ended is not None else None
-        lines.append(
-            f"  {i:>3} {c.node[:28]:<28} "
-            f"{(f'{ttft:.3f}s' if ttft is not None else 'n/a'):>8} "
-            f"{(f'{lat:.3f}s' if lat is not None else 'n/a'):>8} "
-            f"{(c.prompt_tokens or 0):>6} {(c.completion_tokens or 0):>6} "
-            f"{('yes' if c.had_system else 'no'):>4}"
-        )
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
-async def run_once(query: str, allow_clarification: bool, label: str) -> tuple[list[LLMCall], float, str]:
-    handler = MetricsHandler()
+async def run_once(query: str, allow_clarification: bool, label: str) -> tuple[list[ChunkedRequestMetric], float, str]:
+    _CHUNKED_HTTP_CLIENT.reset_metrics()
     config: dict[str, Any] = {
-        "callbacks": [handler],
-        "configurable": {
-            "allow_clarification": allow_clarification,
-        },
+        "configurable": {"allow_clarification": allow_clarification},
     }
     t0 = time.perf_counter()
     result = await deep_researcher.ainvoke(
@@ -249,10 +129,12 @@ async def run_once(query: str, allow_clarification: bool, label: str) -> tuple[l
         config=config,
     )
     wall = time.perf_counter() - t0
+    # Snapshot metrics now in case a later run resets the list.
+    metrics = list(_CHUNKED_HTTP_CLIENT.metrics)
     final_report = result.get("final_report", "") or ""
-    print(format_report(handler.calls, wall, label=label))
+    print(format_report(metrics, wall, label=label))
     print(f"\n[{label}] final_report length: {len(final_report)} chars")
-    return handler.calls, wall, final_report
+    return metrics, wall, final_report
 
 
 async def main() -> None:
@@ -260,7 +142,6 @@ async def main() -> None:
     parser.add_argument(
         "--query",
         default="What are the latest developments in fusion energy in 2026?",
-        help="Research query to drive the workflow.",
     )
     parser.add_argument(
         "--runs",
@@ -271,44 +152,47 @@ async def main() -> None:
     parser.add_argument(
         "--allow-clarification",
         action="store_true",
-        help="Let the clarify_with_user node ask a clarifying question instead of skipping it.",
+        help="Let clarify_with_user ask a question (default off so the workflow runs end-to-end).",
     )
     args = parser.parse_args()
 
-    runs_metrics: list[tuple[list[LLMCall], float]] = []
+    runs: list[tuple[list[ChunkedRequestMetric], float]] = []
     for i in range(1, args.runs + 1):
         label = f"run {i}/{args.runs}"
         print(f"\n>>> starting {label}")
-        calls, wall, _ = await run_once(args.query, args.allow_clarification, label)
-        runs_metrics.append((calls, wall))
+        metrics, wall, _ = await run_once(args.query, args.allow_clarification, label)
+        runs.append((metrics, wall))
 
-    if len(runs_metrics) >= 2:
+    if len(runs) >= 2:
         print("\n" + "=" * 60)
-        print("COLD vs WARM SUMMARY (run 1 vs subsequent runs)")
+        print("COLD vs WARM SUMMARY")
         print("=" * 60)
-        for i, (calls, wall) in enumerate(runs_metrics, 1):
-            ttfts = [c.first_token - c.started for c in calls if c.first_token is not None]
-            mean_ttft = statistics.mean(ttfts) if ttfts else float("nan")
+        for i, (metrics, wall) in enumerate(runs, 1):
+            lats = [m.latency_to_headers for m in metrics if m.latency_to_headers is not None]
+            mean_lat = statistics.mean(lats) if lats else float("nan")
             print(
-                f"  run {i}: wall={wall:.2f}s  llm_calls={len(calls):>3}  "
-                f"mean_ttft={mean_ttft:.3f}s"
+                f"  run {i}: wall={wall:6.2f}s  "
+                f"http_reqs={len(metrics):>3}  "
+                f"mean_lat_to_headers={mean_lat:.3f}s"
             )
-        first_ttfts = [
-            c.first_token - c.started
-            for c in runs_metrics[0][0]
-            if c.first_token is not None
+        base_lats = [
+            m.latency_to_headers
+            for m in runs[0][0]
+            if m.latency_to_headers is not None
         ]
-        if first_ttfts:
-            baseline = statistics.mean(first_ttfts)
-            for i, (calls, _) in enumerate(runs_metrics[1:], 2):
-                ttfts = [
-                    c.first_token - c.started for c in calls if c.first_token is not None
+        if base_lats:
+            baseline = statistics.mean(base_lats)
+            for i, (metrics, _) in enumerate(runs[1:], 2):
+                lats = [
+                    m.latency_to_headers
+                    for m in metrics
+                    if m.latency_to_headers is not None
                 ]
-                if not ttfts:
+                if not lats:
                     continue
-                m = statistics.mean(ttfts)
+                m = statistics.mean(lats)
                 if m > 0:
-                    print(f"  run {i} ttft speedup vs run 1: {baseline / m:.2f}x")
+                    print(f"  run {i} latency speedup vs run 1: {baseline / m:.2f}x")
 
 
 if __name__ == "__main__":

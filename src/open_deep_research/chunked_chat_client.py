@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import sys
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -85,26 +87,90 @@ def split_messages_into_chunks(messages: list[dict]) -> tuple[str, str]:
     return "\n\n".join(system_parts), "\n\n".join(other_parts)
 
 
+@dataclass
+class ChunkedRequestMetric:
+    """Per-request metric recorded by ChunkedChatHTTPClient."""
+    started_at: float  # time.perf_counter() before super().send()
+    response_received_at: float | None = None  # when headers arrived
+    status: int | None = None
+    model: str | None = None
+    n_chunks: int = 0
+    n_anchor_indices: int = 0
+    anchor_chars: int = 0
+    dynamic_chars: int = 0
+    stream: bool = False
+    request_bytes: int = 0
+    has_tools: bool = False
+    error: str | None = None
+
+    @property
+    def latency_to_headers(self) -> float | None:
+        if self.response_received_at is None:
+            return None
+        return self.response_received_at - self.started_at
+
+
 class ChunkedChatHTTPClient(httpx.AsyncClient):
-    """AsyncClient that rewrites chat-completion requests to chunked_chat."""
+    """AsyncClient that rewrites chat-completion requests to chunked_chat
+    and records per-request metrics."""
 
     def __init__(self, *args: Any, agent_id: str | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._agent_id = agent_id
+        self.metrics: list[ChunkedRequestMetric] = []
+
+    def reset_metrics(self) -> None:
+        self.metrics = []
 
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         original_url = str(request.url)
+        metric: ChunkedRequestMetric | None = None
+
         if request.url.path.endswith(_CHAT_SUFFIX):
             request = self._rewrite(request)
             _debug(f"rewrote {original_url} -> {request.url}")
+            metric = self._build_metric(request)
+            self.metrics.append(metric)
         else:
             _debug(f"pass-through {request.method} {request.url}")
-        response = await super().send(request, **kwargs)
+
+        try:
+            response = await super().send(request, **kwargs)
+        except Exception as exc:
+            if metric is not None:
+                metric.error = f"{type(exc).__name__}: {exc}"
+            raise
+
+        if metric is not None:
+            metric.response_received_at = time.perf_counter()
+            metric.status = response.status_code
+
         if response.status_code >= 400:
             msg = f"{request.method} {request.url} -> {response.status_code}"
             logger.warning("chunked_chat: %s", msg)
             _debug(msg)
         return response
+
+    def _build_metric(self, request: httpx.Request) -> ChunkedRequestMetric:
+        try:
+            body = json.loads(request.content) if request.content else {}
+        except Exception:
+            body = {}
+        chunks = body.get("chunks") or []
+        ai_set = set(body.get("anchor_indices") or [])
+        anchor_chars = sum(len(chunks[i]) for i in ai_set if 0 <= i < len(chunks))
+        dynamic_chars = sum(len(c) for i, c in enumerate(chunks) if i not in ai_set)
+        return ChunkedRequestMetric(
+            started_at=time.perf_counter(),
+            model=body.get("model"),
+            n_chunks=len(chunks),
+            n_anchor_indices=len(ai_set),
+            anchor_chars=anchor_chars,
+            dynamic_chars=dynamic_chars,
+            stream=bool(body.get("stream")),
+            request_bytes=len(request.content or b""),
+            has_tools=bool(body.get("tools")),
+        )
 
     def _rewrite(self, request: httpx.Request) -> httpx.Request:
         try:
