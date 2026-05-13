@@ -46,6 +46,8 @@ import asyncio
 import statistics
 import time
 from collections import Counter
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -154,14 +156,45 @@ async def main() -> None:
         action="store_true",
         help="Let clarify_with_user ask a question (default off so the workflow runs end-to-end).",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write per-run final_report files into. "
+             "Defaults to tests/benchmark_outputs/<timestamp>/.",
+    )
     args = parser.parse_args()
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(__file__).parent / "benchmark_outputs" / ts
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n>>> writing per-run outputs to {output_dir}")
 
     runs: list[tuple[list[ChunkedRequestMetric], float]] = []
     for i in range(1, args.runs + 1):
         label = f"run {i}/{args.runs}"
         print(f"\n>>> starting {label}")
-        metrics, wall, _ = await run_once(args.query, args.allow_clarification, label)
+        metrics, wall, final_report = await run_once(
+            args.query, args.allow_clarification, label
+        )
         runs.append((metrics, wall))
+
+        out_path = output_dir / f"run_{i:02d}.md"
+        report_text = format_report(metrics, wall, label=label)
+        with out_path.open("w") as f:
+            f.write(f"# {label}\n\n")
+            f.write(f"**Query:** {args.query}\n\n")
+            f.write(f"**Wall time:** {wall:.3f}s\n\n")
+            f.write(f"**HTTP requests:** {len(metrics)}\n\n")
+            f.write("## Metrics\n\n```\n")
+            f.write(report_text)
+            f.write("\n```\n\n")
+            f.write("## Final Report\n\n")
+            f.write(final_report if final_report else "_(empty)_")
+            f.write("\n")
+        print(f"[{label}] wrote {out_path}")
 
     if len(runs) >= 2:
         print("\n" + "=" * 60)
